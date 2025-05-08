@@ -24,7 +24,7 @@ export function simulate(code: string): Step[] {
   }) as File;
   const steps: Step[] = [];
 
-  /** 상태 모델 */
+  // 상태 모델
   interface VarEntry {
     initialized: boolean;
     value?: any;
@@ -40,14 +40,19 @@ export function simulate(code: string): Step[] {
   }
   const state: SimulatorState = { callStack: [], heap: {}, envStack: [] };
 
-  /** Step 생성 헬퍼 */
+  // Step 생성 헬퍼
   let idCounter = 0;
   const createId = () => `step-${idCounter++}`;
   const createStep = (type: Step['type'], detail: string, data: any = {}) => {
-    steps.push({ id: createId(), type, detail, data });
+    steps.push({
+      id: createId(),
+      type,
+      detail,
+      data: JSON.parse(JSON.stringify(data)),
+    });
   };
 
-  /** 환경 헬퍼 */
+  // 환경 헬퍼
   const currentEnv = (): Env => state.envStack[state.envStack.length - 1]!;
   const lookupVar = (name: string): VarEntry | null => {
     let env: Env | null = currentEnv();
@@ -59,7 +64,7 @@ export function simulate(code: string): Step[] {
     return null;
   };
 
-  // 1) Global Context
+  // 1) Global Execution Context 생성
   createStep(
     'CreateGlobalContext',
     'Global 실행 컨텍스트 생성 및 Call Stack에 push'
@@ -67,7 +72,7 @@ export function simulate(code: string): Step[] {
   state.callStack.push('Global');
   state.envStack.push({ vars: {}, outer: null });
 
-  // 2) 호이스팅: 함수 선언, var, let/const
+  // 2) 전역 호이스팅
   for (const node of ast.program.body) {
     if (node.type === 'FunctionDeclaration') {
       const name = node.id!.name;
@@ -79,8 +84,7 @@ export function simulate(code: string): Step[] {
         name,
       });
       currentEnv().vars[name] = { initialized: true, value: node };
-    }
-    if (node.type === 'VariableDeclaration') {
+    } else if (node.type === 'VariableDeclaration') {
       for (const decl of node.declarations) {
         const name = (decl.id as Identifier).name;
         if (node.kind === 'var') {
@@ -102,7 +106,7 @@ export function simulate(code: string): Step[] {
     }
   }
 
-  // 3) 표현식 평가
+  // 3) 표현식 평가 함수
   const evaluateExpression = (node: Node): any => {
     switch (node.type) {
       case 'StringLiteral':
@@ -110,17 +114,18 @@ export function simulate(code: string): Step[] {
       case 'NumericLiteral':
         return (node as NumericLiteral).value;
       case 'ObjectExpression': {
-        // 생성
         const obj: Record<string, any> = {};
         const objId = createId();
-        createStep('AllocateHeapObject', `Object literal 생성`, {
+        createStep('AllocateHeapObject', 'Object literal 생성', {
           objectId: objId,
         });
-        // 프로퍼티 초기화
-        (node as ObjectExpression).properties.forEach((prop: any) => {
-          if (prop.key.type === 'Identifier') {
+        for (const prop of (node as ObjectExpression).properties) {
+          if (
+            prop.type === 'ObjectProperty' &&
+            prop.key.type === 'Identifier'
+          ) {
             const key = prop.key.name;
-            const val = evaluateExpression(prop.value as Node);
+            const val = evaluateExpression((prop as any).value);
             obj[key] = val;
             createStep('AssignValue', `Object 프로퍼티 '${key}' 초기화`, {
               objectId: objId,
@@ -128,46 +133,38 @@ export function simulate(code: string): Step[] {
               value: val,
             });
           }
-        });
+        }
         return obj;
       }
       case 'Identifier': {
         const name = (node as Identifier).name;
         const entry = lookupVar(name);
-        if (!entry) {
-          createStep(
-            'ThrowReferenceError',
-            `ReferenceError: '${name}' is not defined`
+        if (!entry) throw new ReferenceError(`${name} is not defined`);
+        if (!entry.initialized)
+          throw new ReferenceError(
+            `Cannot access '${name}' before initialization`
           );
-          return undefined;
-        }
-        if (!entry.initialized) {
-          createStep(
-            'ThrowReferenceError',
-            `ReferenceError: Cannot access '${name}' before initialization`
-          );
-          return undefined;
-        }
         return entry.value;
       }
       case 'MemberExpression': {
         const me = node as MemberExpression;
         const obj = evaluateExpression(me.object as Node);
-        const prop = (me.property as Identifier).name;
-        createStep('ExecuteExpression', `MemberExpression '${prop}' 접근`, {
-          object: me.object,
-          property: prop,
-        });
-        const value = obj && obj[prop];
-        return value;
+        if (me.property.type === 'Identifier') {
+          const prop = (me.property as Identifier).name;
+          createStep('ExecuteExpression', `MemberExpression '${prop}' 접근`, {
+            property: prop,
+          });
+          return obj[prop];
+        }
+        return undefined;
       }
       default:
         return undefined;
     }
   };
 
-  // 4) 문장 실행
-  const evaluateStatement = (node: Node) => {
+  // 4) 문장 실행 함수
+  const evaluateStatement = (node: Node): void => {
     if (node.type === 'VariableDeclaration') {
       for (const decl of (node as VariableDeclaration).declarations) {
         const name = (decl.id as Identifier).name;
@@ -181,37 +178,33 @@ export function simulate(code: string): Step[] {
         }
       }
     } else if (node.type === 'ExpressionStatement') {
-      const expr = (node as ExpressionStatement).expression as any;
-      // 대입 문 (d = c, c.greeting = 'Hello')
+      const expr = (node as ExpressionStatement).expression;
       if (expr.type === 'AssignmentExpression') {
         const left = expr.left;
-        const rightVal = evaluateExpression(expr.right as Node);
+        const val = evaluateExpression(expr.right as Node);
         if (left.type === 'Identifier') {
           const name = (left as Identifier).name;
-          createStep('AssignValue', `변수 '${name}'에 값 할당: ${rightVal}`, {
+          createStep('AssignValue', `변수 '${name}'에 값 할당: ${val}`, {
             name,
-            value: rightVal,
+            value: val,
           });
-          currentEnv().vars[name] = { initialized: true, value: rightVal };
+          currentEnv().vars[name] = { initialized: true, value: val };
         } else if (left.type === 'MemberExpression') {
           const me = left as MemberExpression;
           const obj = evaluateExpression(me.object as Node);
           const prop = (me.property as Identifier).name;
-          createStep(
-            'AssignValue',
-            `객체 프로퍼티 '${prop}' 변경: ${rightVal}`,
-            { property: prop, value: rightVal }
-          );
-          obj[prop] = rightVal;
+          createStep('AssignValue', `객체 프로퍼티 '${prop}' 변경: ${val}`, {
+            property: prop,
+            value: val,
+          });
+          obj[prop] = val;
         }
-      }
-      // 함수 호출 or console.log
-      else if (expr.type === 'CallExpression') {
+      } else if (expr.type === 'CallExpression') {
         if (expr.callee.type === 'MemberExpression') {
-          createStep('ExecuteExpression', `console.log() 실행`);
+          createStep('ExecuteExpression', 'console.log() 실행');
           const arg = expr.arguments[0] as Node;
-          const val = evaluateExpression(arg);
-          createStep('LogOutput', `로그 출력: ${val}`, { value: val });
+          const result = evaluateExpression(arg);
+          createStep('LogOutput', `로그 출력: ${result}`, { value: result });
         } else if (expr.callee.type === 'Identifier') {
           const fnName = (expr.callee as Identifier).name;
           createStep(
@@ -232,11 +225,11 @@ export function simulate(code: string): Step[] {
             { name: fnName }
           );
 
-          // 함수 내부 호이스팅
+          // 내부 호이스팅
           const fnDecl = state.heap[fnName];
-          fnDecl.body.body.forEach((s) => {
+          for (const s of fnDecl.body.body) {
             if (s.type === 'VariableDeclaration') {
-              (s as VariableDeclaration).declarations.forEach((d) => {
+              for (const d of (s as VariableDeclaration).declarations) {
                 const n = (d.id as Identifier).name;
                 if ((s as VariableDeclaration).kind === 'var') {
                   createStep(
@@ -258,10 +251,10 @@ export function simulate(code: string): Step[] {
                   );
                   currentEnv().vars[n] = { initialized: false };
                 }
-              });
+              }
             }
-          });
-          fnDecl.body.body.forEach((s) => evaluateStatement(s));
+          }
+          for (const s of fnDecl.body.body) evaluateStatement(s);
           state.callStack.pop();
           state.envStack.pop();
           createStep(
@@ -275,9 +268,25 @@ export function simulate(code: string): Step[] {
   };
 
   // 5) 전역 실행 시작
-  ast.program.body.forEach((node) => {
-    if (node.type !== 'FunctionDeclaration') evaluateStatement(node);
-  });
+  for (const node of ast.program.body) {
+    if (node.type !== 'FunctionDeclaration') {
+      try {
+        evaluateStatement(node);
+      } catch (e: any) {
+        if (e instanceof ReferenceError) {
+          // 전역 코드 중 ReferenceError 발생 시 즉시 함수 컨텍스트 종료
+          createStep(
+            'DestroyExecutionContext',
+            'ReferenceError 발생으로 전역 실행 중단',
+            {}
+          );
+          break;
+        } else {
+          throw e;
+        }
+      }
+    }
+  }
 
   return steps;
 }
